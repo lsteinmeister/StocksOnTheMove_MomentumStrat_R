@@ -1,0 +1,280 @@
+---
+title: "Stocks on the Move"
+author: "Louis Steinmeister"
+date: "2025-01-08"
+output: md_document
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(quantmod)
+library(lubridate)
+library(yfR)
+library(data.table)
+```
+# Intro
+"Stocks on the Move" @clenow2016stocks describes a momentum equity strategy, which we implement in the following. No part of this document should be viewed as investment advice. Further, this document does not implement a backtest. See @clenow2016stocks for that.
+
+Further, note that this document implements the presented strategy step by step in a "quick and dirty" way. This means that this implementation isn't very robust but it allows for experimentation.
+
+
+# Setup
+We define the date range of historic data to be downloaded.
+
+```{r date_range}
+end_date = Sys.Date()
+start_date = end_date - years(2)
+```
+
+## Get Data
+Using the "yfR" package, we obtain relevant ticker data from Yahoo Finance. Here, as in @clenow2016stocks, we define the S&P500 as our trading universe.
+
+```{r get_data, echo=T}
+SP500_data = yf_collection_get("SP500", first_date = start_date, 
+                    last_date = end_date, be_quiet = T)%>% data.table
+SP500_index = yf_get("^SP500TR", first_date = start_date, 
+                    last_date = end_date, be_quiet = T)%>% data.table
+tail(SP500_data)
+tail(SP500_index)
+
+```
+
+# Identifying Momentum
+We identify momentum calculating the slope of an exponential regression on the daily prices (this equals a linear regression on the log. prices). The slope is adjusted by the coefficient of determination, favoring steady increases over eradic price movements.
+
+```{r process, echo=T}
+# compute log prices
+SP500_data[,log_price_close := log(price_adjusted)]
+# transform into wide format with tickers as columns and the log closing prices as entries
+SP500_logPrice = dcast(SP500_data, ref_date ~ ticker, value.var = "log_price_close")
+# change variable type for date from string to Date
+SP500_logPrice[,ref_date := as.Date(ref_date)]
+```
+
+
+```{r det_exp_slope, echo=T}
+# length parameter to estimate the 
+B = 90
+# regression quantities
+X = cbind(rep(1, B), seq(from= -(B-1)/2, to =(B-1)/2, length.out = B))
+XTX = crossprod(X)
+# get R2-adjusted slope
+getAdjSlope = function(y){
+  #print("next step")
+  #print(y)
+  beta = as.vector(solve(a = XTX, b = crossprod(X,y)))
+  
+  #print(beta)
+  
+  y_hat = as.vector(crossprod(t(X), beta))
+  #print(y_hat)
+
+  
+  R2 = 1-crossprod(y_hat-mean(y_hat))/crossprod(y-mean(y))
+  #print(R2)
+  
+  #print((exp(beta[2]*250)-1)*R2)
+  (exp(beta[2]*250)-1)*R2
+}
+# reorder date to ascending 
+SP500_logPrice = SP500_logPrice[order(rank(ref_date))]
+# iterate over columns and obtain adjusted slopws
+regr.coef.lst = frollapply(SP500_logPrice[,-1], n = B, FUN = getAdjSlope)
+# convert list into data.table
+SP500_coeff = data.table(SP500_logPrice$ref_date, do.call(cbind, regr.coef.lst))
+# set column names 
+colnames(SP500_coeff) <- colnames(SP500_logPrice)
+
+tail(SP500_coeff[,1:10]) #let's have a peak
+```
+After obtaining the slopes, let's rank them. A rank of 1 here refers to the best.
+```{r rank_exp_slope, echo=T}
+# rank the adjusted exponential slopes
+SP500_ranks = t(apply(na.omit(SP500_coeff[,-1]), MARGIN = 1, FUN = function(x) rank(-x, ties.method = "min")))
+SP500_ranks = data.table(ref_date = na.omit(SP500_coeff)$ref_date,SP500_ranks)
+
+#rownames(SP500_ranks) = as.character(na.omit(SP500_coeff)$ref_date)
+
+head(SP500_ranks)
+
+```
+# Filters
+To avoid investing in a bear market (correlations tend to increase and we'd like to stay out of the market during such a time) and to ensure that we invest in momentum stocks, we apply a few filters.
+
+## Stock MA Filter
+
+We ensure that the stock is trading avove the moving average
+
+```{r stock_price_filter_fetch_data, echo=T}
+# obtain wide data.table with tickers as columns and adjusted prices as values, ascending by date
+SP500_Prices = dcast(SP500_data, ref_date ~ ticker, value.var = "price_adjusted")[order(rank(ref_date))]
+```
+
+```{r stock_ma_filter, echo=T}
+# make sure that the index is trading above the MA
+# number of days for the moving average
+n_ma = 100
+
+# calculate moving averages with moving windows of defined length
+SP.MA.lst = frollapply(SP500_Prices[,-1], n = n_ma, FUN = mean)
+# convert to data.table
+SP500_MA = data.table(SP500_Prices$ref_date, do.call(cbind, SP.MA.lst))
+colnames(SP500_MA) <- colnames(SP500_Prices)
+print(tail(SP500_MA[,1:10]))
+
+# define data.table with Boolean values indicating whether the filter is passed
+filter_SP500_MA_above = data.table(SP500_Prices[,-1] > SP500_MA[,-1])
+# add date column
+filter_SP500_MA_above = cbind(SP500_Prices[,.(ref_date)], filter_SP500_MA_above)
+tail(filter_SP500_MA_above[,1:10])
+```
+
+## Stock Jump Flter
+Some of the rankings might still be inflated by stocks with extreme price jumps. This is not what we mean with momentum. We desire stocks that steadily move up. Therefore, we exclude stocks with substantial jumps in the last 90 days.
+
+```{r stock_jump_filter_fetch_data, echo=T}
+# obtain wide data.table with tickers as columns and adjusted returns as values, ascending by date
+SP500_returns = dcast(SP500_data, ref_date ~ ticker, value.var = "ret_adjusted_prices")[order(rank(ref_date))]
+```
+
+```{r stock_jmp_filter, echo=T}
+# identify any stock that has jumped more than 15% in the last 90 days.
+# time window in which jumps are not permitted
+n_jmp = 90
+# cutoff for daily returns to be considered a jump 
+jmp_frac = .15
+
+SP.jmp.lst = frollapply(SP500_returns[,-1], n = n_jmp, FUN = function(x) !any(abs(x)>jmp_frac))
+filter_SP500_jmp = data.table(SP500_returns$ref_date, do.call(cbind, SP.jmp.lst))
+colnames(filter_SP500_jmp) <- colnames(SP500_returns)
+print(tail(filter_SP500_jmp[,1:10]))
+```
+
+
+## Market Regime Filter
+
+We don't hold stocks in bear markets. We consider the S&P500 trading below its 200-day MA to be an indicator of a bear market.
+
+```{r index_ma_filter_fetch_data, echo=T}
+# obtain wide data.table with index prices  
+SP500_index_prices = dcast(SP500_index, ref_date ~ ticker, value.var = "price_adjusted")
+# ascending by date
+SP500_index_prices=SP500_index_prices[order(rank(ref_date))]
+```
+
+```{r index_ma_filter, echo=T}
+# check bear market filter
+# window size for moving average
+n_ma = 200
+
+# compute moving average
+SP.I.MA.lst = frollapply(SP500_index_prices[,-1], n = n_ma, FUN = mean)
+SP500_I_MA = data.table(SP500_index_prices$ref_date, do.call(cbind, SP.I.MA.lst))
+colnames(SP500_I_MA) <- colnames(SP500_index_prices)
+print(tail(SP500_I_MA))
+
+# are we trading above the moving average?
+filter_SP500_I_MA_above = data.table(SP500_index_prices[,-1] > SP500_I_MA[,-1])
+filter_SP500_I_MA_above = cbind(SP500_index_prices[,.(ref_date)], filter_SP500_I_MA_above)
+tail(filter_SP500_I_MA_above)
+```
+
+## combine filetrs
+Finally, we combine the results of all the filters into a single data.table.
+
+```{r stock_filter_combined, echo=T}
+# use only dates for which all filters are available
+filter_dates = as.Date(intersect(na.omit(filter_SP500_MA_above)$ref_date,
+                         intersect(na.omit(filter_SP500_jmp)$ref_date,
+                         na.omit(filter_SP500_I_MA_above)$ref_date)))
+# make sure the MA filter and the jump filter both apply
+filters_dt = data.table(filter_SP500_MA_above[ref_date %in% filter_dates,2:ncol(filter_SP500_MA_above)] & 
+  filter_SP500_jmp[ref_date %in% filter_dates,2:ncol(filter_SP500_jmp)])
+marget_regime_filter_vals = unlist(filter_SP500_I_MA_above[ref_date %in% filter_dates, 2])
+# ensure the market regime filter applies in each row
+filters_dt = data.table(filter_dates, apply(filters_dt, MARGIN = 2, function(c_col){
+  c_col & marget_regime_filter_vals}))
+colnames(filters_dt) = colnames(filter_SP500_MA_above)
+tail(filters_dt[,1:10])
+
+```
+
+# Determine Allocations
+
+We size the positions based on risk. To diversify our portfolio, we want to take similar amounts of risk in an array of momentum stocks. We measure the risk as Average True Range (ATR), which is defined as
+$$TR_t = max\{\text{high}_t-\text{low}_t, |\text{high}_t-\text{close}_{t-1}|, |\text{close}_{t-1}-\text{high}_t|\},$$
+$$ATR^{(n)}_t = \frac{1}{n} \sum_{i = 1}^n TR_{t-i}.$$
+
+```{r get_tickers, echo=T}
+get_ordered_tickers = function(at_date, rankings, filters)
+{
+  filters = filters[ref_date == at_date,]
+  
+  
+  # identify permissible tickers
+  tickers_perm = colnames(filters[,-1])[sapply(filters[,-1], function(c_col) all(c_col))]
+  
+
+  if(length(tickers_perm) == 0) return(c())
+  
+  rankings = rankings[ref_date == at_date,c(..tickers_perm)]
+  
+  rankings = rank(rankings, ties.method = "min")
+  
+  return(names(rankings)[order(rankings)])
+}
+o_ticks = get_ordered_tickers(end_date-1, SP500_ranks, filters_dt)
+```
+
+
+## Position Sizing
+
+Let's define the parameters for position sizing:
+```{r pos_sizing_parameters, echo=T}
+risk_factor = 0.005 # 50 bpts per day expected fluctuation
+account_value = 10000
+ATR_n = 20
+```
+
+
+Time to calculate the average true range:
+```{r true_range, echo=T}
+Tickers_close = SP500_logPrice = dcast(SP500_data, ref_date ~ ticker, value.var = "price_close")
+Tickers_high = SP500_logPrice = dcast(SP500_data, ref_date ~ ticker, value.var = "price_high")
+Tickers_low = SP500_logPrice = dcast(SP500_data, ref_date ~ ticker, value.var = "price_close")
+date_vec = Tickers_close$ref_date
+
+Tickers_close = rbind(NA, as.matrix(Tickers_close[,-1]))
+Tickers_close = Tickers_close[-nrow(Tickers_close),]
+
+Tickers_high = as.matrix(Tickers_high[,-1])
+Tickers_low = as.matrix(Tickers_low[,-1])
+
+TR = pmax(Tickers_high-Tickers_low, abs(Tickers_high - Tickers_close), abs(Tickers_close - Tickers_low))
+
+ATR.lst = frollmean(data.table(TR), ATR_n)
+names(ATR.lst) = colnames(TR)
+ATR = cbind(ref_date = date_vec, data.table(do.call(cbind, ATR.lst)))
+
+```
+
+Based on the ATR, we can now compute position sizes.
+```{r calc_positions, echo=T}
+calc_positions = function(at_date, tickers, ATR, account_val, risk_factor = 0.001){
+  
+  ATR_vec = unlist(ATR[ref_date == at_date, 
+                       c(..tickers)])
+  
+  rel_pos = floor(account_val * risk_factor / ATR_vec)
+
+  
+  rel_pos
+}
+
+calc_positions(end_date-1, o_ticks , ATR, account_value)
+```
+These are the whole list of momentum stocks with the number of stocks to purchase. We would start investing from the first to the last, until our cash runs out. Generally, we probably don't want to consider all of these but only the top 20-50.
+
+# References
+<div id="refs"></div>
