@@ -1,2 +1,3 @@
-# StocksOnTheMove_MomentumStrat_R
-Implements a momentum stock trading system
+# A Momentum Stock Trading Strategy in R
+## Based on Stocks on the Move by A. Clenow
+
